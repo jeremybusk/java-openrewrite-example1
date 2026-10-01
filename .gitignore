@@ -8,3 +8,4 @@ __pycache__/
 examples/**/target/
 examples/**/build/
 examples/**/.gradle/
+.env
