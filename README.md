@@ -12,9 +12,16 @@ destination. `artifacts/` and `.migration-work/` are gitignored.
 
 ## Default migration policy
 
+Recipe artifacts resolve from Maven Central by default, with no Code Genome
+account or credentials required. The default versions are pinned to the newest
+releases verified in Maven Central so a later Code Genome-only release cannot
+silently break a run.
+
 - Run `UpgradeToJava<target>` to update sources, build settings, plugins, CI, and
   known incompatible APIs.
 - Migrate JUnit 4 tests to JUnit 5.
+- For Gradle projects, add an explicit JUnit Platform launcher when JUnit is in
+  use so upgraded Jupiter engine and launcher versions stay aligned.
 - Apply OpenRewrite's common static-analysis cleanup.
 - Update dependencies to their latest patch release where version metadata makes
   that possible. Choose `--dependency-strategy none` or `latest` to
@@ -34,24 +41,54 @@ Jakarta EE, and so on) should be added deliberately with `--recipe` and a matchi
 
 ## Credentials
 
-Two independent credentials may be needed:
+Git credentials and recipe-repository credentials are independent:
 
 1. `GIT_TOKEN` is a GitHub/GitLab/Bitbucket PAT used only by a temporary
    `GIT_ASKPASS` helper. It is never put in clone URLs or command logs. Public
    HTTPS repositories need no PAT. Override the username with `--git-username`
    (GitHub defaults to `x-access-token`; GitLab commonly uses `oauth2`). SSH URLs
    use your normal SSH configuration instead.
-2. Current OpenRewrite modules are distributed through the Code Genome Project.
-   Set `CODE_GENOME_USERNAME` and `CODE_GENOME_TOKEN`, or configure your
-   organization's artifact mirror in Maven settings. These are artifact
-   credentials, not Git credentials. Some recipes use the Moderne Source
-   Available License; confirm that your use is licensed.
+2. No recipe-repository credentials are needed for the default Maven Central
+   mode. `CODE_GENOME_USERNAME` and `CODE_GENOME_TOKEN` are read only when
+   `--recipe-repository codegenome` is selected. They are artifact credentials,
+   not Git credentials.
 
 ```bash
 export GIT_TOKEN='your-source-control-pat'
+# Only for --recipe-repository codegenome:
 export CODE_GENOME_USERNAME='you@example.com'
 export CODE_GENOME_TOKEN='your-code-genome-download-token'
 ```
+
+Public source does not necessarily mean Apache-licensed open source. OpenRewrite
+core and many building-block recipes are Apache 2.0, while the comprehensive
+Java migration, static-analysis, and testing recipe modules used by the default
+policy are Moderne Source Available License software. Maven Central mode is
+account-free, but it does not change those artifact licenses. Review the license
+before offering migrations as a product or service.
+
+## Recipe repositories
+
+Three explicit modes are supported:
+
+```bash
+# Default: account-free releases pinned from Maven Central.
+python3 migrate.py ./my-app --recipe-repository maven-central
+
+# Prefer recipes built and installed in ~/.m2/repository, then use Central for
+# their transitive dependencies and the OpenRewrite build plugin.
+python3 migrate.py ./my-app --recipe-repository maven-local \
+  --migrate-java-version YOUR_LOCAL_VERSION
+
+# Opt in to current Code Genome releases.
+python3 migrate.py ./my-app --recipe-repository codegenome
+```
+
+`maven-local` adds `mavenLocal()` for Gradle; Maven already checks its local
+repository first. Use the version flags or repeat `--artifact GROUP:NAME:VERSION`
+when locally built coordinates differ from the pinned defaults. To use an
+organization repository proxy in Central or Code Genome mode, pass
+`--artifact-repository https://repository.example/repository/maven-public`.
 
 ## Dev container and Docker
 
@@ -66,11 +103,14 @@ The same image works directly with Docker:
 docker build -t java-migrator -f .devcontainer/Dockerfile .
 
 docker run --rm \
-  -e GIT_TOKEN -e CODE_GENOME_USERNAME -e CODE_GENOME_TOKEN \
+  -e GIT_TOKEN \
   -v "$PWD:/workspace" -w /workspace \
   java-migrator \
   python3 migrate.py examples --target-java 21 --force
 ```
+
+Add `-e CODE_GENOME_USERNAME -e CODE_GENOME_TOKEN` and
+`--recipe-repository codegenome` only for a Code Genome run.
 
 That migrates both included Java 8 fixtures and writes updated copies beneath
 `artifacts/examples`. Add `--dry-run --verify none` to test copying, discovery,

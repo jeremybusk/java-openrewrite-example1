@@ -57,6 +57,10 @@ class MigratorTests(unittest.TestCase):
             self.assertIn("UpgradeToJava21", content)
             self.assertIn("JUnit4to5Migration", content)
             self.assertIn('newVersion: "latest.patch"', content)
+            self.assertNotIn("junit-platform-launcher", content)
+
+            jm.write_recipe(path, "gradle", args)
+            self.assertIn("junit-platform-launcher", path.read_text())
 
     def test_local_input_is_copied_then_skipped(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -94,6 +98,63 @@ class MigratorTests(unittest.TestCase):
                 "distributionUrl=https\\://services.gradle.org/distributions/gradle-4.10.3-bin.zip\n"
             )
             self.assertEqual("gradle", jm.executable(jm.BuildRoot(root, "gradle")))
+
+    def test_maven_central_is_the_default_repository(self):
+        args = jm.parse_args(["example"])
+        self.assertEqual("maven-central", args.recipe_repository)
+        self.assertEqual("6.46.1", args.maven_plugin_version)
+        self.assertEqual("7.39.0", args.gradle_plugin_version)
+        self.assertEqual("3.42.1", args.migrate_java_version)
+        self.assertIsNone(args.artifact_repository)
+
+    def test_repository_modes_generate_isolated_gradle_repositories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            central = jm.parse_args(["example"])
+            central_path = root / "central.gradle"
+            jm.write_gradle_init(central_path, central, "example.Recipe", root / "rewrite.yml")
+            central_text = central_path.read_text()
+            self.assertIn("mavenCentral()", central_text)
+            self.assertIn('activeRecipe("example.Recipe")', central_text)
+            self.assertIn("configFile = file(", central_text)
+            self.assertNotIn("codegenomeproject.org", central_text)
+            self.assertNotIn("mavenLocal()", central_text)
+
+            local = jm.parse_args(["example", "--recipe-repository", "maven-local"])
+            local_path = root / "local.gradle"
+            jm.write_gradle_init(local_path, local, "example.Recipe", root / "rewrite.yml")
+            self.assertIn("mavenLocal()", local_path.read_text())
+
+            codegenome = jm.parse_args(["example", "--recipe-repository", "codegenome"])
+            codegenome_path = root / "codegenome.gradle"
+            jm.write_gradle_init(
+                codegenome_path, codegenome, "example.Recipe", root / "rewrite.yml"
+            )
+            codegenome_text = codegenome_path.read_text()
+            self.assertIn(jm.CODE_GENOME_URL, codegenome_text)
+            self.assertIn('System.getenv("CODE_GENOME_TOKEN")', codegenome_text)
+            self.assertEqual("3.45.0", codegenome.migrate_java_version)
+
+    def test_central_maven_settings_do_not_add_code_genome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.xml"
+            args = jm.parse_args(["example"])
+            args.maven_settings = Path(directory) / "missing-settings.xml"
+            jm.write_maven_settings(path, args, {})
+            content = path.read_text()
+            self.assertIn("<settings", content)
+            self.assertNotIn("codegenome", content)
+
+    def test_parent_git_boundary_is_temporary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            (parent / ".git").mkdir()
+            copied_project = parent / "artifacts" / "app"
+            copied_project.mkdir(parents=True)
+            marker = copied_project / ".git"
+            with jm.isolate_from_parent_git(copied_project):
+                self.assertTrue(marker.is_file())
+            self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import csv
 import dataclasses
 import datetime as dt
@@ -26,7 +27,16 @@ from pathlib import Path
 from typing import Sequence
 
 
-VERSIONS = {
+MAVEN_CENTRAL_VERSIONS = {
+    "maven_plugin": "6.46.1",
+    # 7.40+ depends on rewrite-bom 8.91+, which is Code Genome-only.
+    "gradle_plugin": "7.39.0",
+    "migrate_java": "3.42.1",
+    "static_analysis": "2.41.1",
+    "java_dependencies": "1.60.2",
+    "testing_frameworks": "3.44.0",
+}
+CODE_GENOME_VERSIONS = {
     "maven_plugin": "6.49.0",
     "gradle_plugin": "7.41.0",
     "migrate_java": "3.45.0",
@@ -289,6 +299,24 @@ def check_clean(path: Path, allow_dirty: bool) -> None:
         raise MigrationError("repository has uncommitted changes; commit/stash them or pass --allow-dirty")
 
 
+@contextlib.contextmanager
+def isolate_from_parent_git(root: Path):
+    """Stop build plugins from applying an ancestor repository's ignore rules."""
+    marker = root / ".git"
+    ancestor_has_git = any((parent / ".git").exists() for parent in root.parents)
+    created = not marker.exists() and ancestor_has_git
+    if created:
+        # OpenRewrite stops searching for a repository at this marker. Because it
+        # is intentionally not a valid repository, the copied project is parsed
+        # without treating an ignored artifacts/ parent as an exclusion.
+        marker.write_text("temporary java-migrator repository boundary\n", encoding="utf-8")
+    try:
+        yield
+    finally:
+        if created:
+            marker.unlink(missing_ok=True)
+
+
 def discover_builds(root: Path, requested: str, max_depth: int) -> list[BuildRoot]:
     ignored = {".git", ".gradle", ".idea", ".migration-work", "build", "target", "node_modules"}
     candidates: list[BuildRoot] = []
@@ -349,6 +377,33 @@ def artifacts(args: argparse.Namespace) -> list[str]:
     return result
 
 
+def remote_recipe_repository(args: argparse.Namespace) -> str | None:
+    """Return the explicitly configured recipe repository, if one is needed."""
+    if args.artifact_repository:
+        return args.artifact_repository
+    if args.recipe_repository == "codegenome":
+        return CODE_GENOME_URL
+    return None
+
+
+def gradle_repositories(args: argparse.Namespace, indent: str) -> str:
+    """Generate repository declarations without writing credential values to disk."""
+    repositories: list[str] = []
+    if args.recipe_repository == "maven-local":
+        repositories.append(f"{indent}mavenLocal()")
+    remote = remote_recipe_repository(args)
+    if remote:
+        credentials = ""
+        if args.recipe_repository == "codegenome":
+            credentials = (
+                ' credentials { username = System.getenv("CODE_GENOME_USERNAME"); '
+                'password = System.getenv("CODE_GENOME_TOKEN") }'
+            )
+        repositories.append(f'{indent}maven {{ url = uri("{remote}");{credentials} }}')
+    repositories.append(f"{indent}mavenCentral()")
+    return "\n".join(repositories)
+
+
 def write_recipe(path: Path, tool: str, args: argparse.Namespace) -> str:
     name = "com.acme.migration.ModernizeJava"
     items = [
@@ -360,6 +415,22 @@ def write_recipe(path: Path, tool: str, args: argparse.Namespace) -> str:
         items.append("org.openrewrite.staticanalysis.CommonStaticAnalysis")
     if args.junit5:
         items.append("org.openrewrite.java.testing.junit5.JUnit4to5Migration")
+        if tool == "gradle":
+            # Modern Gradle embeds a JUnit Platform launcher that can lag behind
+            # the Jupiter version selected by dependency upgrades. An explicit
+            # launcher keeps the platform engine and launcher aligned. Separate
+            # preconditions cover both pre-migration JUnit 4 and existing JUnit
+            # Jupiter source because type checks see the original source set.
+            for junit_type in ("org.junit.*", "org.junit.jupiter.api.*"):
+                items.append(
+                    "org.openrewrite.java.dependencies.AddDependency:\n"
+                    "      groupId: org.junit.platform\n"
+                    "      artifactId: junit-platform-launcher\n"
+                    "      version: 1.x\n"
+                    "      configuration: testRuntimeOnly\n"
+                    f"      onlyIfUsing: {junit_type}\n"
+                    "      acceptTransitive: false"
+                )
     if args.build_best_practices:
         items.append("org.openrewrite.maven.BestPractices" if tool == "maven" else "org.openrewrite.gradle.GradleBestPractices")
     if args.dependency_strategy != "none":
@@ -381,21 +452,25 @@ def write_recipe(path: Path, tool: str, args: argparse.Namespace) -> str:
     return name
 
 
-def write_gradle_init(path: Path, args: argparse.Namespace, env: dict[str, str]) -> None:
+def write_gradle_init(
+    path: Path, args: argparse.Namespace, recipe: str, recipe_file: Path,
+) -> None:
     dependencies = "\n".join(f'        rewrite("{item}")' for item in artifacts(args))
-    credentials = ""
-    if env.get("CODE_GENOME_USERNAME") and env.get("CODE_GENOME_TOKEN"):
-        credentials = ' credentials { username = System.getenv("CODE_GENOME_USERNAME"); password = System.getenv("CODE_GENOME_TOKEN") }'
+    init_repositories = gradle_repositories(args, "        ")
+    project_repositories = gradle_repositories(args, "            ")
     path.write_text(
         "initscript {\n    repositories {\n"
-        f'        maven {{ url = uri("{args.artifact_repository}");{credentials} }}\n'
-        '        mavenCentral()\n        maven { url = uri("https://plugins.gradle.org/m2") }\n'
+        f"{init_repositories}\n"
+        '        maven { url = uri("https://plugins.gradle.org/m2") }\n'
         f'    }}\n    dependencies {{ classpath("org.openrewrite:plugin:{args.gradle_plugin_version}") }}\n}}\n'
         "rootProject {\n    plugins.apply(org.openrewrite.gradle.RewritePlugin)\n    dependencies {\n"
-        f"{dependencies}\n    }}\n    afterEvaluate {{\n"
-        "        if (repositories.isEmpty()) { repositories { mavenCentral() } }\n"
+        f"{dependencies}\n    }}\n    rewrite {{\n"
+        f"        activeRecipe({json.dumps(recipe)})\n"
+        f"        configFile = file({json.dumps(str(recipe_file))})\n"
+        "        setExportDatatables(true)\n"
+        "    }\n    afterEvaluate {\n"
         "        repositories {\n"
-        f'            maven {{ url = uri("{args.artifact_repository}");{credentials} }}\n'
+        f"{project_repositories}\n"
         "        }\n    }\n}\n",
         encoding="utf-8",
     )
@@ -422,31 +497,41 @@ def xml_add(parent: ET.Element, name: str, text: str) -> ET.Element:
 
 def write_maven_settings(path: Path, args: argparse.Namespace, env: dict[str, str]) -> None:
     source = args.maven_settings or Path.home() / ".m2" / "settings.xml"
+    remote = remote_recipe_repository(args)
+    if not remote:
+        if source.is_file():
+            shutil.copyfile(source, path)
+        else:
+            path.write_text('<?xml version="1.0" encoding="UTF-8"?>\n<settings/>\n', encoding="utf-8")
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        return
     try:
         root = ET.parse(source).getroot() if source.is_file() else ET.Element("settings")
     except ET.ParseError as exc:
         raise MigrationError(f"invalid Maven settings {source}: {exc}") from exc
+    repository_id = "codegenome" if args.recipe_repository == "codegenome" else "java-migrator-recipes"
     username, token = env.get("CODE_GENOME_USERNAME"), env.get("CODE_GENOME_TOKEN")
-    if username and token:
+    if args.recipe_repository == "codegenome" and username and token:
         servers = xml_get_or_add(root, "servers")
         for server in list(servers):
             identity = xml_find(server, "id")
-            if identity is not None and identity.text == "codegenome":
+            if identity is not None and identity.text == repository_id:
                 servers.remove(server)
         server = ET.SubElement(servers, xml_name(root, "server"))
-        xml_add(server, "id", "codegenome")
+        xml_add(server, "id", repository_id)
         xml_add(server, "username", username)
         xml_add(server, "password", token)
     profiles = xml_get_or_add(root, "profiles")
     profile = ET.SubElement(profiles, xml_name(root, "profile"))
-    xml_add(profile, "id", "java-migrator-codegenome")
+    profile_id = "java-migrator-recipes"
+    xml_add(profile, "id", profile_id)
     for collection_name, item_name in (("repositories", "repository"), ("pluginRepositories", "pluginRepository")):
         collection = ET.SubElement(profile, xml_name(root, collection_name))
         item = ET.SubElement(collection, xml_name(root, item_name))
-        xml_add(item, "id", "codegenome")
-        xml_add(item, "url", args.artifact_repository)
+        xml_add(item, "id", repository_id)
+        xml_add(item, "url", remote)
     active = xml_get_or_add(root, "activeProfiles")
-    xml_add(active, "activeProfile", "java-migrator-codegenome")
+    xml_add(active, "activeProfile", profile_id)
     ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
     path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
@@ -480,8 +565,6 @@ def rewrite_command(
         ]
     return [
         exe, "--no-daemon", "--stacktrace", "--init-script", str(init_script), "rewriteRun",
-        f"-Drewrite.activeRecipe={recipe}", f"-Drewrite.configLocation={recipe_file}",
-        "-Drewrite.exportDatatables=true",
     ]
 
 
@@ -549,7 +632,7 @@ def migrate_project(
         init_script = temp / "init.gradle"
         recipe = write_recipe(recipe_file, build.tool, args)
         write_maven_settings(settings, args, env)
-        write_gradle_init(init_script, args, env)
+        write_gradle_init(init_script, args, recipe, recipe_file)
         command = rewrite_command(build, recipe, recipe_file, settings, init_script, args)
         if args.dry_run:
             log.parent.mkdir(parents=True, exist_ok=True)
@@ -586,15 +669,16 @@ def migrate_one(spec: RepoSpec, args: argparse.Namespace, env: dict[str, str], a
         result.branch = checkout_branch(repo, args, env, log)
         state = args.workspace / ".state"
         state.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=f"{name}-", dir=state) as temp_name:
-            for index, build in enumerate(builds):
-                say(f"[{name}] {build.tool}: {build.path.relative_to(repo)}")
-                project_temp = Path(temp_name) / str(index)
-                project_temp.mkdir()
-                project = migrate_project(build, args, env, log, project_temp)
-                result.projects.append(project)
-                if project.status == "failed" and not args.continue_projects:
-                    break
+        with isolate_from_parent_git(repo):
+            with tempfile.TemporaryDirectory(prefix=f"{name}-", dir=state) as temp_name:
+                for index, build in enumerate(builds):
+                    say(f"[{name}] {build.tool}: {build.path.relative_to(repo)}")
+                    project_temp = Path(temp_name) / str(index)
+                    project_temp.mkdir()
+                    project = migrate_project(build, args, env, log, project_temp)
+                    result.projects.append(project)
+                    if project.status == "failed" and not args.continue_projects:
+                        break
         failures = [project for project in result.projects if project.status == "failed"]
         if failures:
             raise MigrationError("; ".join(f"{item.path}: {item.error}" for item in failures))
@@ -668,19 +752,34 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--git-token-env", default="GIT_TOKEN")
     parser.add_argument("--git-username", default="x-access-token")
     parser.add_argument("--maven-settings", type=Path)
-    parser.add_argument("--artifact-repository", default=CODE_GENOME_URL,
-                        help="Code Genome endpoint or an organization Maven mirror")
-    parser.add_argument("--maven-plugin-version", default=VERSIONS["maven_plugin"])
-    parser.add_argument("--gradle-plugin-version", default=VERSIONS["gradle_plugin"])
-    parser.add_argument("--migrate-java-version", default=VERSIONS["migrate_java"])
-    parser.add_argument("--static-analysis-version", default=VERSIONS["static_analysis"])
-    parser.add_argument("--java-dependencies-version", default=VERSIONS["java_dependencies"])
-    parser.add_argument("--testing-frameworks-version", default=VERSIONS["testing_frameworks"])
+    parser.add_argument(
+        "--recipe-repository",
+        choices=("maven-central", "maven-local", "codegenome"),
+        default="maven-central",
+        help="where recipe artifacts are resolved; Code Genome is opt-in",
+    )
+    parser.add_argument(
+        "--artifact-repository",
+        help="optional Maven-compatible mirror/remote URL (supplements the selected mode)",
+    )
+    parser.add_argument("--maven-plugin-version", help="automatic for the selected repository mode")
+    parser.add_argument("--gradle-plugin-version", help="automatic for the selected repository mode")
+    parser.add_argument("--migrate-java-version", help="automatic for the selected repository mode")
+    parser.add_argument("--static-analysis-version", help="automatic for the selected repository mode")
+    parser.add_argument("--java-dependencies-version", help="automatic for the selected repository mode")
+    parser.add_argument("--testing-frameworks-version", help="automatic for the selected repository mode")
     args = parser.parse_args(argv)
     if args.jobs < 1 or args.timeout < 1 or args.max_depth < 0:
         parser.error("--jobs and --timeout must be positive; --max-depth cannot be negative")
     if args.push and (not args.commit or not args.branch):
         parser.error("--push requires --commit and a non-empty --branch")
+    if args.recipe_repository == "maven-local" and args.artifact_repository:
+        parser.error("--artifact-repository cannot be combined with --recipe-repository maven-local")
+    defaults = CODE_GENOME_VERSIONS if args.recipe_repository == "codegenome" else MAVEN_CENTRAL_VERSIONS
+    for name, value in defaults.items():
+        attribute = f"{name}_version"
+        if getattr(args, attribute) is None:
+            setattr(args, attribute, value)
     args.workspace = args.workspace.expanduser().resolve()
     args.output = args.output.expanduser().resolve()
     return args
@@ -699,7 +798,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         env["MIGRATOR_GIT_USERNAME"] = args.git_username
         with tempfile.TemporaryDirectory(prefix="java-migrator-", dir=state) as temp:
             askpass = make_askpass(Path(temp))
-            say(f"Migrating {len(specs)} repository(s) to Java {args.target_java} with {args.jobs} worker(s)")
+            say(
+                f"Migrating {len(specs)} repository(s) to Java {args.target_java} with "
+                f"{args.jobs} worker(s); recipes: {args.recipe_repository}"
+            )
             if args.jobs == 1:
                 results = [migrate_one(spec, args, env, askpass) for spec in specs]
             else:
@@ -708,6 +810,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary = {
             "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "target_java": args.target_java,
+            "recipe_repository": args.recipe_repository,
+            "recipe_artifacts": artifacts(args),
+            "plugin_versions": {
+                "maven": args.maven_plugin_version,
+                "gradle": args.gradle_plugin_version,
+            },
             "counts": {status: sum(item.status == status for item in results)
                        for status in ("changed", "unchanged", "planned", "skipped", "failed")},
             "results": [dataclasses.asdict(item) for item in results],
