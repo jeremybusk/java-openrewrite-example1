@@ -9,7 +9,7 @@ USER root
 RUN rm -f /etc/apt/sources.list.d/yarn.list \
     && apt-get update \
     && export DEBIAN_FRONTEND=noninteractive \
-    && apt-get install -y --no-install-recommends python3 python3-pip git git-lfs curl unzip ca-certificates \
+    && apt-get install -y --no-install-recommends python3 python3-pip python3-yaml git git-lfs curl unzip ca-certificates \
     && curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tar.gz \
     && tar -xzf /tmp/maven.tar.gz -C /opt \
     && ln -s "/opt/apache-maven-${MAVEN_VERSION}/bin/mvn" /usr/local/bin/mvn \

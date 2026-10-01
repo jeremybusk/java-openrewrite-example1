@@ -45,22 +45,123 @@ class MigratorTests(unittest.TestCase):
                 {(item.path, item.tool) for item in builds},
             )
 
-    def test_generated_recipe_contains_target_and_policies(self):
+    def test_generated_recipe_contains_phase_recipes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rewrite.yml"
-            args = argparse.Namespace(
-                target_java=21, cleanup=True, junit5=True,
-                build_best_practices=False, dependency_strategy="patch", recipe=[],
+            phase = jm.MigrationPhase(
+                "java",
+                (
+                    "org.openrewrite.java.migrate.UpgradeToJava21",
+                    "org.openrewrite.java.migrate.UpgradeDockerImageVersion:\n      version: 21",
+                ),
             )
-            jm.write_recipe(path, "maven", args)
+            name = jm.write_recipe(path, phase)
             content = path.read_text()
+            self.assertEqual("com.acme.migration.Java", name)
             self.assertIn("UpgradeToJava21", content)
-            self.assertIn("JUnit4to5Migration", content)
-            self.assertIn('newVersion: "latest.patch"', content)
-            self.assertNotIn("junit-platform-launcher", content)
+            self.assertIn("UpgradeDockerImageVersion", content)
 
-            jm.write_recipe(path, "gradle", args)
-            self.assertIn("junit-platform-launcher", path.read_text())
+    def test_analysis_drives_recipe_packs_and_excludes_generated_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src" / "main" / "java").mkdir(parents=True)
+            (root / "src" / "generated").mkdir(parents=True)
+            (root / "build.gradle").write_text(
+                "implementation 'org.projectlombok:lombok:1.18.20'\n"
+                "annotationProcessor 'org.mapstruct:mapstruct-processor:1.4.2.Final'\n"
+                "testImplementation 'junit:junit:4.12'\n"
+                "testImplementation 'org.mockito:mockito-core:4.11.0'\n"
+            )
+            (root / "src" / "main" / "java" / "Legacy.java").write_text(
+                "import sun.misc.Unsafe; import org.junit.Test; class Legacy {}\n"
+            )
+            (root / "src" / "generated" / "Generated.java").write_text(
+                "import javax.xml.bind.JAXBContext; class Generated {}\n"
+            )
+            (root / ".github" / "workflows").mkdir(parents=True)
+            (root / ".github" / "workflows" / "build.yml").write_text("name: build\n")
+            args = jm.parse_args([str(root)])
+            build = jm.BuildRoot(root, "gradle")
+            analysis = jm.analyze_project(build, args)
+            self.assertTrue({"lombok", "mapstruct", "junit", "mockito", "jdk-internals"}
+                            <= set(analysis.features))
+            self.assertNotIn("removed-jdk-modules", analysis.features)
+            self.assertIn("src/generated", analysis.excluded_paths)
+            self.assertEqual([".github/workflows/build.yml"], analysis.external_configuration)
+            self.assertTrue(any("External CI/toolchain" in item for item in analysis.findings))
+
+            phases = jm.migration_phases(build, analysis, args)
+            names = [phase.name for phase in phases]
+            self.assertEqual(
+                ["java", "compatibility", "testing-migration", "testing-cleanup",
+                 "dependencies", "cleanup"],
+                names,
+            )
+            recipes = "\n".join(recipe for phase in phases for recipe in phase.recipes)
+            self.assertIn("AddLombokMapstructBinding", recipes)
+            self.assertIn("Mockito4to5Only", recipes)
+            self.assertIn("junit-platform-launcher", recipes)
+            self.assertNotIn("junit:junit", recipes)
+
+    def test_dependency_policy_skips_stacks_unless_pinned(self):
+        args = jm.parse_args([
+            "example", "--dependency-pin", "org.springframework:spring-core=6.2.12",
+            "--dependency-deny", "com.acme:*",
+        ])
+        analysis = jm.ProjectAnalysis(dependencies=[
+            jm.Dependency("com.acme", "internal", "1.0"),
+            jm.Dependency("org.springframework", "spring-core", "5.3.1"),
+            jm.Dependency("com.fasterxml.jackson.core", "jackson-core", "2.12.1"),
+            jm.Dependency("org.apache.commons", "commons-lang3", "3.8"),
+            jm.Dependency("org.apache.commons", "commons-lang3", "3.9"),
+        ])
+        recipes = "\n".join(jm.dependency_recipes(analysis, args))
+        self.assertIn('artifactId: "spring-core"', recipes)
+        self.assertIn('newVersion: "6.2.12"', recipes)
+        self.assertIn('artifactId: "commons-lang3"', recipes)
+        self.assertEqual(1, recipes.count('artifactId: "commons-lang3"'))
+        self.assertNotIn("internal", recipes)
+        self.assertNotIn("jackson-core", recipes)
+
+    def test_policy_controls_profile_packs_dependencies_and_verification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "policy.json"
+            path.write_text(json.dumps({
+                "version": 1,
+                "profile": "conservative",
+                "targetJava": 17,
+                "packs": {"testing": "none", "jakarta": "10"},
+                "dependencies": {
+                    "strategy": "latest",
+                    "deny": ["com.acme:*"],
+                    "pin": {"org.example:*": "2.0.0"},
+                },
+                "excludePaths": ["**/snapshots/**"],
+                "verification": {
+                    "build": "compile", "postChecks": "all", "strict": True,
+                    "commands": ["./smoke-test"],
+                },
+            }))
+            args = jm.parse_args(["example", "--policy", str(path)])
+            self.assertEqual(17, args.target_java)
+            self.assertEqual("none", args.testing_modernization)
+            self.assertEqual("10", args.jakarta)
+            self.assertEqual("latest", args.dependency_strategy)
+            self.assertEqual("2.0.0", args.dependency_pin["org.example:*"])
+            self.assertIn("**/snapshots/**", args.exclusions)
+            self.assertEqual("compile", args.verify)
+            self.assertEqual("all", args.post_checks)
+            self.assertTrue(args.strict_post_checks)
+            self.assertEqual(["./smoke-test"], args.verify_command)
+
+    def test_report_only_profile_has_no_rewrite_phases(self):
+        args = jm.parse_args(["example", "--profile", "report-only"])
+        phases = jm.migration_phases(
+            jm.BuildRoot(Path("example"), "maven"), jm.ProjectAnalysis(), args,
+        )
+        self.assertEqual([], phases)
+        self.assertEqual("none", args.dependency_strategy)
+        self.assertEqual([], jm.artifacts(args))
 
     def test_local_input_is_copied_then_skipped(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -119,6 +220,7 @@ class MigratorTests(unittest.TestCase):
             self.assertIn("configFile = file(", central_text)
             self.assertNotIn("codegenomeproject.org", central_text)
             self.assertNotIn("mavenLocal()", central_text)
+            self.assertIn('exclusion("**/generated/**"', central_text)
 
             local = jm.parse_args(["example", "--recipe-repository", "maven-local"])
             local_path = root / "local.gradle"

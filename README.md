@@ -17,27 +17,91 @@ account or credentials required. The default versions are pinned to the newest
 releases verified in Maven Central so a later Code Genome-only release cannot
 silently break a run.
 
+- Analyze each build before rewriting. The report records direct dependencies,
+  detected frameworks/languages, removed JDK APIs, internal JDK usage, generated
+  paths, and external CI/toolchain files.
+- Run separate Java, compatibility, test migration, test cleanup, dependency,
+  source cleanup, and custom-recipe phases. Every phase and its recipes are
+  recorded independently, so a failure has a useful boundary.
 - Run `UpgradeToJava<target>` to update sources, build settings, plugins, CI, and
-  known incompatible APIs.
-- Migrate JUnit 4 tests to JUnit 5.
-- For Gradle projects, add an explicit JUnit Platform launcher when JUnit is in
-  use so upgraded Jupiter engine and launcher versions stay aligned.
-- Apply OpenRewrite's common static-analysis cleanup.
-- Update dependencies to their latest patch release where version metadata makes
-  that possible. Choose `--dependency-strategy none` or `latest` to
-  change this policy.
+  known incompatible APIs. Java EE/Jakarta changes remain explicit because a
+  namespace change often crosses application-server and contract boundaries.
+- Migrate JUnit 4 to JUnit 5 when JUnit is detected. The standard pack also
+  migrates Mockito 4 to 5 and applies JUnit 5 best practices; Gradle projects get
+  an explicit JUnit Platform launcher to keep engine and launcher versions
+  aligned.
+- Upgrade only direct, literal-version dependencies. Coordinated ecosystems such
+  as Spring, Hibernate, Jackson, JUnit, and Mockito are skipped unless pinned;
+  deny rules and organization-approved pins can further constrain updates.
+- Apply common static-analysis cleanup after compatibility work.
 - Discover independent Maven and Gradle build roots in monorepos without running
   ordinary nested modules twice.
 - Clone submodules by default, support Git LFS, and use the container Gradle when
   an old wrapper cannot start on the modern migration JVM.
-- Run tests after rewriting and retain failures for diagnosis.
+- Run tests after rewriting, then run `jdeps --jdk-internals` and
+  `jdeprscan --for-removal`; retain diagnostic output and failures in JSON reports.
 - List likely stale Java 8 runbooks/configuration in each project's
   `manual_review` report field instead of deleting organization-specific files.
 
 `--build-best-practices` is opt-in because the current Gradle composite can make
-a Gradle major-version upgrade. Framework migrations (Spring Boot, Quarkus,
-Jakarta EE, and so on) should be added deliberately with `--recipe` and a matching
-`--artifact`; there is no universally safe framework target.
+a Gradle major-version upgrade. Framework migrations such as Spring Boot and
+Quarkus should be added deliberately with `--recipe` and a matching `--artifact`;
+there is no universally safe framework target.
+
+## Profiles and policy as code
+
+Profiles set risk-appropriate defaults; any individual option can override them.
+
+| Profile | Cleanup | Tests | Dependencies | Post-checks |
+| --- | --- | --- | --- | --- |
+| `conservative` | off | JUnit migration | none | JDK diagnostics |
+| `standard` (default) | common cleanup | JUnit + Mockito | patch | JDK diagnostics |
+| `aggressive` | cleanup + build best practices | deeper Mockito cleanup | latest | JDK + dependency report |
+| `report-only` | no rewrite | no rewrite | no rewrite | analysis only |
+
+Start by inventorying a portfolio without downloading recipe artifacts:
+
+```bash
+python3 migrate.py --manifest repositories.txt --profile report-only --jobs 4
+```
+
+For repeatable fleet migrations, copy
+[`migration-policy.example.yml`](migration-policy.example.yml), review its deny
+rules and pins, then run:
+
+```bash
+python3 migrate.py --manifest repositories.txt \
+  --policy migration-policy.yml --jobs 4
+```
+
+The policy supports `targetJava`, `buildTool`, profiles, test/Jakarta/Lombok
+packs, dependency strategy/deny/pin rules, exclusion globs, extra recipes and
+artifacts, build verification, JDK/dependency diagnostics, strict diagnostics,
+and custom verification commands. CLI options take precedence. YAML support is
+included in the devcontainer; a JSON policy works with a stock Python install.
+
+Useful targeted packs and safety controls:
+
+```bash
+# Explicit Java EE namespace/application-server target.
+python3 migrate.py ./legacy-ee --jakarta 10
+
+# Lombok cleanup is opt-in; Lombok + MapStruct binding is detected automatically.
+python3 migrate.py ./service --lombok-best-practices
+
+# Protect or approve individual dependency families.
+python3 migrate.py ./service \
+  --dependency-deny 'com.mycompany:*' \
+  --dependency-pin 'org.apache.commons:commons-lang3=3.17.0'
+
+# Treat jdeps/jdeprscan/custom check failures as migration failures.
+python3 migrate.py ./service --post-checks all --strict-post-checks \
+  --verify-command './scripts/integration-test.sh'
+```
+
+Generated and vendored trees are excluded by default. Repeat `--exclude` for
+project-specific globs or use `--no-default-exclusions` when generated sources
+are intentionally migration input.
 
 ## Credentials
 

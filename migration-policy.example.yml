@@ -1,0 +1,38 @@
+version: 1
+profile: standard
+targetJava: 21
+buildTool: auto
+
+packs:
+  testing: standard
+  jakarta: "none"
+  lombokBestPractices: false
+
+dependencies:
+  strategy: patch
+  # These globs protect coordinated stacks and dependencies that need a
+  # deliberate migration rather than an independent version bump.
+  deny:
+    - "com.mycompany:*"
+    - "log4j:log4j"
+  pin:
+    # Quote versions so YAML always treats them as strings.
+    "org.apache.commons:commons-lang3": "3.17.0"
+
+excludePaths:
+  - "**/src/generated/**"
+  - "**/fixtures/**"
+
+# Extra OpenRewrite recipes and their artifacts can be supplied here. If
+# artifacts is non-empty, it replaces the tool's default recipe artifact set.
+recipes: []
+artifacts: []
+
+verification:
+  build: test
+  postChecks: jdk
+  strict: false
+  # Each item is parsed as an argv-style command without invoking a shell.
+  # commands:
+  #   - "./scripts/integration-test.sh"
+  commands: []
