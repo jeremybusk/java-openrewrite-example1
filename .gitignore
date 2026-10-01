@@ -1,0 +1,10 @@
+.migration-work/
+artifacts/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+.vscode/
+examples/**/target/
+examples/**/build/
+examples/**/.gradle/

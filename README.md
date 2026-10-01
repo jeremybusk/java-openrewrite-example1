@@ -1,1 +1,149 @@
-# java-openrewrite-example1
+# Java OpenRewrite migration engine
+
+A batch migration CLI for cloning public or private Git repositories and moving
+Maven and Gradle applications to Java 11, 17, 21, or 25. Java 21 is the default.
+It runs in a Microsoft dev container, uses a repository's build wrapper when
+available, isolates failures, verifies migrated builds, and emits JSON reports.
+
+The tool never modifies a local input directory. It copies local inputs or clones
+remote inputs to `artifacts/<name>` and migrates that copy. If the destination
+already exists it is reported as `skipped`; pass `--force` to replace that one
+destination. `artifacts/` and `.migration-work/` are gitignored.
+
+## Default migration policy
+
+- Run `UpgradeToJava<target>` to update sources, build settings, plugins, CI, and
+  known incompatible APIs.
+- Migrate JUnit 4 tests to JUnit 5.
+- Apply OpenRewrite's common static-analysis cleanup.
+- Update dependencies to their latest patch release where version metadata makes
+  that possible. Choose `--dependency-strategy none` or `latest` to
+  change this policy.
+- Discover independent Maven and Gradle build roots in monorepos without running
+  ordinary nested modules twice.
+- Clone submodules by default, support Git LFS, and use the container Gradle when
+  an old wrapper cannot start on the modern migration JVM.
+- Run tests after rewriting and retain failures for diagnosis.
+- List likely stale Java 8 runbooks/configuration in each project's
+  `manual_review` report field instead of deleting organization-specific files.
+
+`--build-best-practices` is opt-in because the current Gradle composite can make
+a Gradle major-version upgrade. Framework migrations (Spring Boot, Quarkus,
+Jakarta EE, and so on) should be added deliberately with `--recipe` and a matching
+`--artifact`; there is no universally safe framework target.
+
+## Credentials
+
+Two independent credentials may be needed:
+
+1. `GIT_TOKEN` is a GitHub/GitLab/Bitbucket PAT used only by a temporary
+   `GIT_ASKPASS` helper. It is never put in clone URLs or command logs. Public
+   HTTPS repositories need no PAT. Override the username with `--git-username`
+   (GitHub defaults to `x-access-token`; GitLab commonly uses `oauth2`). SSH URLs
+   use your normal SSH configuration instead.
+2. Current OpenRewrite modules are distributed through the Code Genome Project.
+   Set `CODE_GENOME_USERNAME` and `CODE_GENOME_TOKEN`, or configure your
+   organization's artifact mirror in Maven settings. These are artifact
+   credentials, not Git credentials. Some recipes use the Moderne Source
+   Available License; confirm that your use is licensed.
+
+```bash
+export GIT_TOKEN='your-source-control-pat'
+export CODE_GENOME_USERNAME='you@example.com'
+export CODE_GENOME_TOKEN='your-code-genome-download-token'
+```
+
+## Dev container and Docker
+
+In VS Code, choose **Dev Containers: Reopen in Container**. The image is based on
+Microsoft's Java 21 Debian Trixie devcontainer and includes Python, Maven, and
+Gradle. Trixie is used instead of Ubuntu to stay on Microsoft's current default
+Java devcontainer line with fewer distribution-specific variables.
+
+The same image works directly with Docker:
+
+```bash
+docker build -t java-migrator -f .devcontainer/Dockerfile .
+
+docker run --rm \
+  -e GIT_TOKEN -e CODE_GENOME_USERNAME -e CODE_GENOME_TOKEN \
+  -v "$PWD:/workspace" -w /workspace \
+  java-migrator \
+  python3 migrate.py examples --target-java 21 --force
+```
+
+That migrates both included Java 8 fixtures and writes updated copies beneath
+`artifacts/examples`. Add `--dry-run --verify none` to test copying, discovery,
+recipe generation, and reporting without downloading artifacts.
+
+For Java 25 build verification, use a Java 25 image:
+
+```bash
+docker build --build-arg JAVA_VARIANT=25-trixie --build-arg GRADLE_VERSION=9.1.0 \
+  -t java-migrator:jdk25 -f .devcontainer/Dockerfile .
+```
+
+Gradle 9.1 is the minimum release that can itself run on Java 25; the default
+Gradle 8.14 line is retained for better compatibility while bootstrapping older
+projects on the default Java 21 image. For especially old Gradle/Android/Kotlin
+builds, migrate and validate Java 21 first, then use that output as the input to
+a separate Java 25 run.
+
+## Local and remote repositories
+
+```bash
+# The source is untouched; the result is artifacts/java8-maven.
+python3 migrate.py ./examples/java8-maven --target-java 21 --force
+
+# Clone and migrate a public or private repository.
+python3 migrate.py https://github.com/acme/service.git --target-java 21
+
+# Commit and push the result on automation/java-21.
+python3 migrate.py https://github.com/acme/service.git \
+  --target-java 21 --commit --push --force
+```
+
+Without `--commit`, changes remain uncommitted for review. `--push` requires a
+commit and a branch. Logs and JSON reports live in `.migration-work/`.
+
+## Batch migration
+
+TXT manifests accept `URL` or `URL REF`; CSV accepts `url,ref`; JSON accepts URL
+strings or objects like `{"url": "...", "ref": "main"}`.
+
+```bash
+python3 migrate.py --manifest repositories.txt \
+  --target-java 21 --jobs 4 --continue-projects
+```
+
+Keep concurrency conservative: each OpenRewrite JVM can consume substantial CPU
+and memory. The command returns nonzero if any repository fails. Re-running skips
+destinations already present; `--force` discards and recreates only the matching
+output destination.
+
+Git submodules are cloned by default; opt out with `--no-submodules`. Private
+dependency repositories continue to use your Maven settings and environment, so
+mount `~/.m2`/`~/.gradle` when a Docker run needs organization-specific config.
+
+Useful controls:
+
+```bash
+python3 migrate.py ./my-app --verify compile --dependency-strategy none
+python3 migrate.py ./my-app --no-cleanup --no-junit5
+python3 migrate.py ./mixed-repo --build-tool maven --max-depth 6
+```
+
+## Java 8 fixtures
+
+[`examples/`](examples/) contains independent Maven and Gradle apps with Java 8
+compiler settings, JUnit 4, stale dependencies/plugins, deprecated APIs,
+redundant source patterns, an old Java container, and obsolete runbooks. Prose
+and intentionally dead files demonstrate a boundary: a safe general-purpose
+tool should report them for human review rather than guess that they can be
+deleted.
+
+Run the unit tests with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```

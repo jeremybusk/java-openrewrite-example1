@@ -1,0 +1,30 @@
+{
+  "name": "Java OpenRewrite Migration Engine",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "..",
+    "args": {
+      "JAVA_IMAGE_VERSION": "3",
+      "JAVA_VARIANT": "21-trixie"
+    }
+  },
+  "containerEnv": {
+    "GIT_TOKEN": "${localEnv:GIT_TOKEN}",
+    "CODE_GENOME_USERNAME": "${localEnv:CODE_GENOME_USERNAME}",
+    "CODE_GENOME_TOKEN": "${localEnv:CODE_GENOME_TOKEN}"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "vscjava.vscode-java-pack",
+        "redhat.java"
+      ],
+      "settings": {
+        "java.configuration.updateBuildConfiguration": "interactive"
+      }
+    }
+  },
+  "remoteUser": "vscode",
+  "postCreateCommand": "python3 migrate.py --help >/dev/null && java -version && mvn -version && gradle -version"
+}

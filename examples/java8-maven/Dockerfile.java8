@@ -1,0 +1,4 @@
+# Deliberately stale migration input. The migration should update or flag this.
+FROM openjdk:8-jre-alpine
+COPY target/java8-maven-app-1.0-SNAPSHOT.jar /app.jar
+ENTRYPOINT ["java", "-jar", "/app.jar"]

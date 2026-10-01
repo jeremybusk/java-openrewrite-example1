@@ -1,0 +1,3 @@
+# One URL per line. An optional branch/tag/SHA may follow the URL.
+https://github.com/example/service-one.git main
+https://github.com/example/service-two.git

@@ -1,0 +1,25 @@
+plugins {
+    id 'java'
+}
+
+group = 'com.example.legacy'
+version = '1.0-SNAPSHOT'
+
+// Intentionally old Gradle/Java conventions for migration testing.
+sourceCompatibility = 1.8
+targetCompatibility = 1.8
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'com.google.guava:guava:20.0'
+    testImplementation 'junit:junit:4.12'
+}
+
+test {
+    testLogging {
+        events 'failed'
+    }
+}
