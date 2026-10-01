@@ -9,3 +9,4 @@ examples/**/target/
 examples/**/build/
 examples/**/.gradle/
 .env
+tmp/
