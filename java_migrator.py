@@ -1104,6 +1104,180 @@ def checkout_branch(repo: Path, args: argparse.Namespace, env: dict[str, str], l
     return branch
 
 
+def markdown_code(value: object) -> str:
+    text = str(value).replace("`", "\\`").replace("\n", " ")
+    return f"`{text}`"
+
+
+def markdown_cell(value: object) -> str:
+    return str(value).replace("|", "\\|").replace("\r", "").replace("\n", "<br>")
+
+
+def render_result_markdown(result: Result) -> str:
+    lines = [
+        f"# Java migration report: {destination_name(result.source)}",
+        "",
+        f"- Status: **{result.status}**",
+        f"- Source: {markdown_code(result.source)}",
+        f"- Output: {markdown_code(result.path)}",
+        f"- Duration: {result.duration_seconds:.2f} seconds",
+        f"- Changed: {'yes' if result.changed else 'no'}",
+    ]
+    if result.branch:
+        lines.append(f"- Branch: {markdown_code(result.branch)}")
+    if result.commit:
+        lines.append(f"- Commit: {markdown_code(result.commit)}")
+    lines.append(f"- Log: {markdown_code(result.log)}")
+    if result.error:
+        lines += ["", "## Error", "", result.error]
+    if result.diff_stat:
+        lines += ["", "## Diff summary", "", "```text", result.diff_stat, "```"]
+
+    if not result.projects:
+        lines += ["", "No build projects were processed."]
+        return "\n".join(lines) + "\n"
+
+    for index, project in enumerate(result.projects, 1):
+        title = Path(project.path).name or project.path
+        lines += [
+            "", f"## Project {index}: {title}", "",
+            f"- Build tool: **{project.build_tool}**",
+            f"- Status: **{project.status}**",
+            f"- Path: {markdown_code(project.path)}",
+        ]
+        if project.error:
+            lines.append(f"- Error: {project.error}")
+
+        analysis = project.analysis
+        lines += ["", "### Analysis", ""]
+        lines.append(
+            "Detected features: "
+            + (", ".join(markdown_code(item) for item in analysis.features) or "None")
+        )
+        if analysis.findings:
+            lines += ["", "Findings:", ""] + [f"- {item}" for item in analysis.findings]
+        if analysis.external_configuration:
+            lines += ["", "External configuration:", ""] + [
+                f"- {markdown_code(item)}" for item in analysis.external_configuration
+            ]
+        if analysis.excluded_paths:
+            lines += ["", "Excluded paths:", ""] + [
+                f"- {markdown_code(item)}" for item in analysis.excluded_paths
+            ]
+        manual_items = [item for item in project.manual_review if item not in analysis.findings]
+        if manual_items:
+            lines += ["", "Manual review:", ""] + [
+                f"- {markdown_code(item)}" for item in manual_items
+            ]
+
+        if analysis.dependencies:
+            lines += [
+                "", "### Direct dependencies", "",
+                "| Group | Artifact | Current version | Configuration |",
+                "| --- | --- | --- | --- |",
+            ]
+            lines += [
+                f"| {markdown_cell(item.group)} | {markdown_cell(item.artifact)} | "
+                f"{markdown_cell(item.version)} | {markdown_cell(item.configuration or '—')} |"
+                for item in analysis.dependencies
+            ]
+
+        if project.phases:
+            lines += [
+                "", "### Migration phases", "",
+                "| Phase | Status | Changed | Recipes |",
+                "| --- | --- | --- | --- |",
+            ]
+            for phase in project.phases:
+                recipes = "<br>".join(
+                    markdown_cell(recipe.splitlines()[0].removesuffix(":"))
+                    for recipe in phase.recipes
+                ) or "—"
+                lines.append(
+                    f"| {markdown_cell(phase.name)} | {markdown_cell(phase.status)} | "
+                    f"{'yes' if phase.changed else 'no'} | {recipes} |"
+                )
+                if phase.error:
+                    lines += ["", f"**{phase.name} error:** {phase.error}"]
+
+        if project.checks:
+            lines += [
+                "", "### Verification checks", "",
+                "| Check | Status | Exit code | Command |",
+                "| --- | --- | --- | --- |",
+            ]
+            for check in project.checks:
+                command = shlex.join(check.command) if check.command else "—"
+                returncode = "—" if check.returncode is None else str(check.returncode)
+                lines.append(
+                    f"| {markdown_cell(check.name)} | {markdown_cell(check.status)} | "
+                    f"{returncode} | {markdown_cell(command)} |"
+                )
+    return "\n".join(lines) + "\n"
+
+
+def render_summary_markdown(summary: dict[str, Any], results: Sequence[Result]) -> str:
+    lines = [
+        "# Java migration summary", "",
+        f"- Generated: {markdown_code(summary['generated_at'])}",
+        f"- Target Java: **{summary['target_java']}**",
+        f"- Profile: **{summary['profile']}**",
+        f"- Recipe repository: {markdown_code(summary['recipe_repository'])}",
+        "", "## Results", "",
+        "| Status | Count |", "| --- | ---: |",
+    ]
+    lines += [f"| {status} | {count} |" for status, count in summary["counts"].items()]
+    artifacts_used = summary.get("recipe_artifacts", [])
+    lines += ["", "## Recipe artifacts", ""]
+    lines += ([f"- {markdown_code(item)}" for item in artifacts_used]
+              if artifacts_used else ["No recipe artifacts were used."])
+    lines += [
+        "", "## Repositories", "",
+        "| Source | Status | Changed | Duration | Output | Report |",
+        "| --- | --- | --- | ---: | --- | --- |",
+    ]
+    for result in results:
+        report_name = f"{slug(result.source)}.md"
+        lines.append(
+            f"| {markdown_cell(result.source)} | {markdown_cell(result.status)} | "
+            f"{'yes' if result.changed else 'no'} | {result.duration_seconds:.2f}s | "
+            f"{markdown_cell(result.path)} | [{report_name}]({report_name}) |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def write_result_reports(result: Result, args: argparse.Namespace, name: str) -> list[Path]:
+    directory = args.workspace / "reports"
+    directory.mkdir(parents=True, exist_ok=True)
+    outputs: list[Path] = []
+    if args.report_format in {"both", "json"}:
+        path = directory / f"{name}.json"
+        path.write_text(json.dumps(dataclasses.asdict(result), indent=2) + "\n", encoding="utf-8")
+        outputs.append(path)
+    if args.report_format in {"both", "markdown"}:
+        path = directory / f"{name}.md"
+        path.write_text(render_result_markdown(result), encoding="utf-8")
+        outputs.append(path)
+    return outputs
+
+
+def write_summary_reports(
+    summary: dict[str, Any], results: Sequence[Result], args: argparse.Namespace,
+) -> list[Path]:
+    directory = args.workspace / "reports"
+    directory.mkdir(parents=True, exist_ok=True)
+    outputs: list[Path] = []
+    if args.report_format in {"both", "json"}:
+        path = directory / "summary.json"
+        path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        outputs.append(path)
+    if args.report_format in {"both", "markdown"}:
+        path = directory / "summary.md"
+        path.write_text(render_summary_markdown(summary, results), encoding="utf-8")
+        outputs.append(path)
+    return outputs
+
+
 def migrate_project(
     build: BuildRoot, args: argparse.Namespace, env: dict[str, str], log: Path, temp: Path,
 ) -> ProjectResult:
@@ -1226,9 +1400,7 @@ def migrate_one(spec: RepoSpec, args: argparse.Namespace, env: dict[str, str], a
         result.error = str(exc)
     finally:
         result.duration_seconds = round(time.monotonic() - started, 2)
-        report = args.workspace / "reports" / f"{name}.json"
-        report.parent.mkdir(parents=True, exist_ok=True)
-        report.write_text(json.dumps(dataclasses.asdict(result), indent=2) + "\n", encoding="utf-8")
+        write_result_reports(result, args, name)
         say(f"[{name}] {result.status} ({result.duration_seconds}s){': ' + result.error if result.error else ''}")
     return result
 
@@ -1242,8 +1414,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     packs = policy.get("packs", {})
     dependency_policy = policy.get("dependencies", {})
     verification_policy = policy.get("verification", {})
-    if not all(isinstance(item, dict) for item in (packs, dependency_policy, verification_policy)):
-        raise MigrationError("policy packs, dependencies, and verification values must be mappings")
+    reporting_policy = policy.get("reporting", {})
+    if not all(isinstance(item, dict) for item in
+               (packs, dependency_policy, verification_policy, reporting_policy)):
+        raise MigrationError(
+            "policy packs, dependencies, verification, and reporting values must be mappings"
+        )
     parser = argparse.ArgumentParser(
         description="Clone and modernize Maven/Gradle Java repositories with OpenRewrite.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -1260,6 +1436,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="updated repository/directory copies")
     parser.add_argument("--workspace", type=Path, default=Path(".migration-work"),
                         help="logs, reports, and temporary state")
+    parser.add_argument("--report-format", choices=("both", "json", "markdown"),
+                        default=reporting_policy.get("format", "both"),
+                        help="report file formats to generate")
     parser.add_argument("--target-java", type=int, choices=TARGETS,
                         default=policy.get("targetJava", 21))
     parser.add_argument("--build-tool", choices=("auto", "maven", "gradle"),
@@ -1356,6 +1535,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error(f"unsupported buildTool in policy: {args.build_tool}")
     if args.verify not in {"none", "compile", "test"}:
         parser.error(f"unsupported verification.build in policy: {args.verify}")
+    if args.report_format not in {"both", "json", "markdown"}:
+        parser.error(f"unsupported reporting.format in policy: {args.report_format}")
     profile_defaults = PROFILE_DEFAULTS[args.profile]
     for attribute in ("cleanup", "testing_modernization", "dependency_strategy",
                       "build_best_practices", "post_checks"):
@@ -1429,14 +1610,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "gradle": args.gradle_plugin_version,
             },
             "profile": args.profile,
+            "report_format": args.report_format,
             "counts": {status: sum(item.status == status for item in results)
                        for status in ("changed", "unchanged", "analyzed", "planned", "skipped", "failed")},
             "results": [dataclasses.asdict(item) for item in results],
         }
-        output = args.workspace / "reports" / "summary.json"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-        say(f"Summary: {output} ({summary['counts']['failed']} failed)")
+        outputs = write_summary_reports(summary, results, args)
+        say(f"Summary: {', '.join(str(path) for path in outputs)} "
+            f"({summary['counts']['failed']} failed)")
         return 1 if summary["counts"]["failed"] else 0
     except (MigrationError, OSError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)

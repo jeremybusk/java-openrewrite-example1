@@ -28,6 +28,9 @@ excludePaths:
 recipes: []
 artifacts: []
 
+reporting:
+  format: both
+
 verification:
   build: test
   postChecks: jdk

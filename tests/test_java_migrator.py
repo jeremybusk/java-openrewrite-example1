@@ -141,6 +141,7 @@ class MigratorTests(unittest.TestCase):
                     "build": "compile", "postChecks": "all", "strict": True,
                     "commands": ["./smoke-test"],
                 },
+                "reporting": {"format": "json"},
             }))
             args = jm.parse_args(["example", "--policy", str(path)])
             self.assertEqual(17, args.target_java)
@@ -153,6 +154,7 @@ class MigratorTests(unittest.TestCase):
             self.assertEqual("all", args.post_checks)
             self.assertTrue(args.strict_post_checks)
             self.assertEqual(["./smoke-test"], args.verify_command)
+            self.assertEqual("json", args.report_format)
 
     def test_report_only_profile_has_no_rewrite_phases(self):
         args = jm.parse_args(["example", "--profile", "report-only"])
@@ -207,6 +209,71 @@ class MigratorTests(unittest.TestCase):
         self.assertEqual("7.39.0", args.gradle_plugin_version)
         self.assertEqual("3.42.1", args.migrate_java_version)
         self.assertIsNone(args.artifact_repository)
+        self.assertEqual("both", args.report_format)
+
+    def test_json_and_markdown_reports_are_generated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            args = argparse.Namespace(workspace=workspace, report_format="both")
+            project = jm.ProjectResult(
+                path="/tmp/output/app",
+                build_tool="maven",
+                status="changed",
+                changed=True,
+                manual_review=["docs/JAVA8.md"],
+                analysis=jm.ProjectAnalysis(
+                    features=["junit"],
+                    dependencies=[jm.Dependency("junit", "junit", "4.12", "test")],
+                    findings=["JUnit migration requires review."],
+                    excluded_paths=["src/generated"],
+                    external_configuration=[".github/workflows/build.yml"],
+                ),
+                phases=[jm.PhaseResult(
+                    "testing-migration", "changed", True,
+                    ["org.openrewrite.java.testing.junit5.JUnit4to5Migration"],
+                )],
+                checks=[jm.CheckResult(
+                    "jdk-internals", "passed", ["jdeps", "--jdk-internals"], 0,
+                    "detailed diagnostic output",
+                )],
+            )
+            result = jm.Result(
+                source="https://github.com/acme/app.git",
+                path="/tmp/output/app",
+                status="changed",
+                changed=True,
+                duration_seconds=12.5,
+                log="/tmp/logs/app.log",
+                diff_stat="2 files changed",
+                projects=[project],
+            )
+            outputs = jm.write_result_reports(result, args, "app-12345678")
+            self.assertEqual(
+                {workspace / "reports" / "app-12345678.json",
+                 workspace / "reports" / "app-12345678.md"},
+                set(outputs),
+            )
+            markdown = (workspace / "reports" / "app-12345678.md").read_text()
+            self.assertIn("# Java migration report: app", markdown)
+            self.assertIn("JUnit4to5Migration", markdown)
+            self.assertIn("docs/JAVA8.md", markdown)
+            self.assertNotIn("detailed diagnostic output", markdown)
+            structured = json.loads((workspace / "reports" / "app-12345678.json").read_text())
+            self.assertEqual("detailed diagnostic output", structured["projects"][0]["checks"][0]["output"])
+
+            summary = {
+                "generated_at": "2026-10-01T00:00:00+00:00",
+                "target_java": 21,
+                "profile": "standard",
+                "recipe_repository": "maven-central",
+                "recipe_artifacts": ["org.example:recipes:1.0"],
+                "counts": {"changed": 1, "failed": 0},
+            }
+            summary_outputs = jm.write_summary_reports(summary, [result], args)
+            self.assertEqual(2, len(summary_outputs))
+            summary_markdown = (workspace / "reports" / "summary.md").read_text()
+            self.assertIn("# Java migration summary", summary_markdown)
+            self.assertIn("[app-", summary_markdown)
 
     def test_repository_modes_generate_isolated_gradle_repositories(self):
         with tempfile.TemporaryDirectory() as directory:
